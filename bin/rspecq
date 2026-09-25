@@ -178,6 +178,13 @@ else
   redis_opts[:host] = opts[:redis_host]
 end
 
+# redis-client defaults to 1s for connect/read/write, which a TLS endpoint over
+# the public internet can exceed on the first handshake and kill a worker.
+redis_opts[:timeout] = Float(ENV["RSPECQ_REDIS_TIMEOUT"]) if ENV["RSPECQ_REDIS_TIMEOUT"]
+if ENV["RSPECQ_REDIS_RECONNECT_ATTEMPTS"]
+  redis_opts[:reconnect_attempts] = Integer(ENV["RSPECQ_REDIS_RECONNECT_ATTEMPTS"])
+end
+
 Sentry.init if ENV["SENTRY_DSN"]
 
 if opts[:report]

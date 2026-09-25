@@ -68,6 +68,10 @@ OPTIONS:
     -r, --redis HOST                 --redis is deprecated. Use --redis-host or --redis-url instead. Redis host to connect to (default: 127.0.0.1).
         --redis-host HOST            Redis host to connect to (default: 127.0.0.1).
         --redis-url URL              Redis URL to connect to (e.g.: redis://127.0.0.1:6379/0).
+
+Two connection settings are environment-only: `RSPECQ_REDIS_TIMEOUT` (seconds,
+float; redis-client defaults to 1) and `RSPECQ_REDIS_RECONNECT_ATTEMPTS`
+(integer, default 0). Raise them when Redis sits across the public internet.
         --update-timings             Update the global job timings key with the timings of this build. Note: This key is used as the basis for job scheduling.
         --timings-key KEY            Update KEY instead of the default global timings key.
         --file-split-threshold N     Split spec files slower than N seconds and schedule them as individual examples.
