@@ -2,6 +2,7 @@ require "json"
 require "pathname"
 require "pp"
 require "open3"
+require "tmpdir"
 
 module RSpecQ
   # A Worker, given a build ID, continuously consumes tests off the
@@ -237,12 +238,16 @@ module RSpecQ
         pending = rest
       end
 
-      queue.push_jobs(jobs, fail_fast, publish: false)
-
       # Populate splitted slow files
       pending += files_to_example_ids(slow_files)
 
-      queue.push_jobs(order_jobs_by_timings(pending), fail_fast)
+      # Slow work goes to the head of the queue: whole slow files when the
+      # split fell back, or their examples when it worked. Appending them
+      # after the fast files puts the longest jobs at the tail, where every
+      # other worker idles waiting for them.
+      queue.push_jobs(order_jobs_by_timings(pending), fail_fast, publish: false)
+
+      queue.push_jobs(jobs, fail_fast)
     end
 
     def default_timing
@@ -296,8 +301,12 @@ module RSpecQ
     # falling back to scheduling them as whole files. Their errors will be
     # reported in the normal flow when they're eventually picked up by a worker.
     def files_to_example_ids(files)
-      cmd = "DISABLE_SPRING=1 bundle exec rspec --dry-run --format json #{files.join(' ')}"
+      # The JSON goes to a file: anything the app prints to stdout while
+      # booting (Rails warnings, deprecations) would break the parse.
+      json_path = File.join(Dir.tmpdir, "rspecq-dry-run-#{Process.pid}.json")
+      cmd = "DISABLE_SPRING=1 bundle exec rspec --dry-run --format json --out #{json_path} #{files.join(' ')}"
       out, err, cmd_result = Open3.capture3(cmd)
+      out = File.read(json_path) if File.exist?(json_path)
 
       if !cmd_result.success?
         rspec_output = begin
