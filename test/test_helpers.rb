@@ -3,8 +3,11 @@ require "securerandom"
 require "rspecq"
 
 module TestHelpers
-  REDIS_OPTS = { host: "127.0.0.1" }.freeze
-  EXEC_CMD = "bundle exec rspecq".freeze
+  # Tests flush this database before each test, so it defaults to one that
+  # nothing else on a shared dev Redis is likely to use.
+  REDIS_URL = ENV.fetch("RSPECQ_TEST_REDIS_URL", "redis://127.0.0.1:6379/15").freeze
+  REDIS_OPTS = { url: REDIS_URL }.freeze
+  EXEC_CMD = "bundle exec rspecq --redis-url #{REDIS_URL}".freeze
 
   def rand_id
     SecureRandom.hex(4)
