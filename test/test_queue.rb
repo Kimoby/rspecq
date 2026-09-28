@@ -74,4 +74,83 @@ class TestQueue < RSpecQTest
     worker = new_worker("not-existing")
     assert_equal 200, worker.default_timing, "Default timing should be the median of file timings, not example timings"
   end
+
+  def test_reserve_next_job_reserves_and_records_heartbeat
+    queue = RSpecQ::Queue.new(rand_id, rand_id, REDIS_OPTS)
+    queue.push_jobs(["job1", "job2"])
+
+    assert_equal ["reserved", "job1", nil, nil], queue.reserve_next_job
+    assert_equal ["job2"], queue.unprocessed_jobs
+    assert_includes queue.worker_heartbeats.keys, queue.worker_id
+  end
+
+  def test_reserve_next_job_is_empty_until_published
+    queue = RSpecQ::Queue.new(rand_id, rand_id, REDIS_OPTS)
+    queue.push_jobs(["job1"], publish: false)
+    queue.redis.lpop(queue.key_queue_unprocessed)
+
+    assert_equal "empty", queue.reserve_next_job.first
+  end
+
+  def test_reserve_next_job_is_empty_while_others_still_run
+    build_id = rand_id
+    other = RSpecQ::Queue.new(build_id, rand_id, REDIS_OPTS)
+    queue = RSpecQ::Queue.new(build_id, rand_id, REDIS_OPTS)
+    queue.push_jobs(["job1"])
+
+    assert_equal "reserved", other.reserve_next_job.first
+    assert_equal "empty", queue.reserve_next_job.first
+
+    other.complete_job("job1", example_count: 1, duration: 1.0)
+    assert_equal "exhausted", queue.reserve_next_job.first
+  end
+
+  def test_reserve_next_job_requeues_the_job_of_a_dead_worker
+    build_id = rand_id
+    dead = RSpecQ::Queue.new(build_id, "dead", REDIS_OPTS)
+    queue = RSpecQ::Queue.new(build_id, rand_id, REDIS_OPTS)
+    queue.push_jobs(["job1", "job2"])
+
+    assert_equal "job1", dead.reserve_next_job[1]
+    dead.redis.zadd(dead.key_worker_heartbeats, 0, "dead")
+
+    assert_equal ["reserved", "job1", "job1", "dead"], queue.reserve_next_job
+    assert_equal 1, queue.lost_jobs_count
+    assert_equal ["job2"], queue.unprocessed_jobs
+  end
+
+  def test_reserve_next_job_stops_when_build_failed_fast
+    queue = RSpecQ::Queue.new(rand_id, rand_id, REDIS_OPTS)
+    queue.push_jobs(["job1"], 1)
+    queue.record_example_failure("job0[1:1]", "boom")
+
+    assert_equal ["failed_fast"], queue.reserve_next_job
+    assert_equal ["job1"], queue.unprocessed_jobs
+  end
+
+  def test_complete_job
+    queue = RSpecQ::Queue.new(rand_id, rand_id, REDIS_OPTS)
+    queue.push_jobs(["job1"])
+    queue.reserve_next_job
+
+    queue.complete_job("job1", example_count: 3, duration: 1.5)
+
+    assert_equal 3, queue.example_count
+    assert_equal 1.5, queue.job_build_timing("job1")
+    assert_equal 1500, queue.total_execution_time_ms
+    assert_equal ["job1"], queue.processed_jobs
+    assert_equal "exhausted", queue.reserve_next_job.first
+  end
+
+  def test_complete_job_without_summary_only_acknowledges
+    queue = RSpecQ::Queue.new(rand_id, rand_id, REDIS_OPTS)
+    queue.push_jobs(["job1"])
+    queue.reserve_next_job
+
+    queue.complete_job("job1", example_count: nil, duration: nil)
+
+    assert_equal 0, queue.example_count
+    assert_nil queue.job_build_timing("job1")
+    assert_equal ["job1"], queue.processed_jobs
+  end
 end

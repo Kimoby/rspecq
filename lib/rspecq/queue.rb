@@ -13,42 +13,74 @@ module RSpecQ
   # - previous job timing statistics used to optimally schedule the jobs
   # - the set of executed jobs
   class Queue
-    RESERVE_JOB = <<~LUA.freeze
-      local queue = KEYS[1]
-      local queue_running = KEYS[2]
+    # Everything a worker needs before running its next job, in one round
+    # trip: refresh its heartbeat, stop if the build failed fast, put one job
+    # of a dead worker back to the queue, then reserve the head of the queue.
+    #
+    # The heartbeat is written first so that the dead-worker scan never sees
+    # the calling worker as dead.
+    #
+    # Returns {status, job, lost_job, lost_worker}, where status is one of
+    # "reserved", "failed_fast", "exhausted" or "empty" (nothing to reserve
+    # yet, but the build is not over).
+    RESERVE_NEXT_JOB = <<~LUA.freeze
+      local key_worker_heartbeats = KEYS[1]
+      local key_queue_running = KEYS[2]
+      local key_queue_unprocessed = KEYS[3]
+      local key_queue_lost = KEYS[4]
+      local key_queue_config = KEYS[5]
+      local key_failures = KEYS[6]
+      local key_errors = KEYS[7]
+      local key_queue_status = KEYS[8]
       local worker_id = ARGV[1]
+      local timeout = tonumber(ARGV[2])
 
-      local job = redis.call('lpop', queue)
-      if job then
-        redis.call('hset', queue_running, worker_id, job)
-        return job
-      else
-        return nil
+      local time_now = tonumber(redis.call('time')[1])
+      redis.call('zadd', key_worker_heartbeats, time_now, worker_id)
+
+      local fail_fast = tonumber(redis.call('hget', key_queue_config, 'fail_fast'))
+      if fail_fast and fail_fast > 0 and
+          redis.call('hlen', key_failures) + redis.call('hlen', key_errors) >= fail_fast then
+        return {'failed_fast'}
       end
-    LUA
 
-    # Scans for dead workers and puts their reserved jobs back to the queue.
-    REQUEUE_LOST_JOB = <<~LUA.freeze
-      local worker_heartbeats = KEYS[1]
-      local queue_running = KEYS[2]
-      local queue_unprocessed = KEYS[3]
-      local queue_lost = KEYS[4]
-      local time_now = ARGV[1]
-      local timeout = ARGV[2]
-
-      local dead_workers = redis.call('zrangebyscore', worker_heartbeats, 0, time_now - timeout)
+      local lost_job = false
+      local lost_worker = false
+      local dead_workers = redis.call('zrangebyscore', key_worker_heartbeats, 0, time_now - timeout)
       for _, worker in ipairs(dead_workers) do
-        local job = redis.call('hget', queue_running, worker)
+        local job = redis.call('hget', key_queue_running, worker)
         if job then
-          redis.call('lpush', queue_unprocessed, job)
-          redis.call('hdel', queue_running, worker)
-          redis.call('zincrby', queue_lost, 1, job)
-
-          return {job, worker}
+          redis.call('lpush', key_queue_unprocessed, job)
+          redis.call('hdel', key_queue_running, worker)
+          redis.call('zincrby', key_queue_lost, 1, job)
+          lost_job = job
+          lost_worker = worker
+          break
         end
       end
 
-      return nil
+      local job = redis.call('lpop', key_queue_unprocessed)
+      if job then
+        redis.call('hset', key_queue_running, worker_id, job)
+        return {'reserved', job, lost_job, lost_worker}
+      end
+
+      local status = redis.call('get', key_queue_status)
+      local published = false
+      for i = 3, #ARGV do
+        if status == ARGV[i] then published = true end
+      end
+
+      if published and redis.call('hlen', key_queue_running) == 0 then
+        return {'exhausted', false, lost_job, lost_worker}
+      end
+
+      return {'empty', false, lost_job, lost_worker}
+    LUA
+
+    # TIME is read inside the script so a heartbeat costs one round trip.
+    RECORD_WORKER_HEARTBEAT = <<~LUA.freeze
+      redis.call('zadd', KEYS[1], redis.call('time')[1], ARGV[1])
     LUA
 
     REQUEUE_JOB = <<~LUA.freeze
@@ -132,37 +164,40 @@ module RSpecQ
       jobs.size
     end
 
-    def reserve_job
+    # See RESERVE_NEXT_JOB. Returns [status, job, lost_job, lost_worker].
+    def reserve_next_job
       eval_script(
-        RESERVE_JOB,
-        keys: [
-          key_queue_unprocessed,
-          key_queue_running,
-        ],
-        argv: [@worker_id]
-      )
-    end
-
-    def requeue_lost_job
-      eval_script(
-        REQUEUE_LOST_JOB,
+        RESERVE_NEXT_JOB,
         keys: [
           key_worker_heartbeats,
           key_queue_running,
           key_queue_unprocessed,
-          key_queue_lost
+          key_queue_lost,
+          key_queue_config,
+          key_failures,
+          key_errors,
+          key_queue_status
         ],
         argv: [
-          current_time,
-          WORKER_LIVENESS_SEC
+          @worker_id,
+          WORKER_LIVENESS_SEC,
+          STATUS_READY,
+          STATUS_SUCCESS,
+          STATUS_FAILURE
         ]
       )
     end
 
+    # Records the job's example count and timing, and acknowledges it, in
+    # one round trip. `duration` and `example_count` are nil when RSpec did
+    # not produce a summary for the job.
+    #
     # NOTE: The same job might happen to be acknowledged more than once, in
     # the case of requeues.
-    def acknowledge_job(job)
+    def complete_job(job, example_count:, duration:)
       redis.multi do |pipeline|
+        pipeline.incrby(key_example_count, example_count) if example_count&.positive?
+        pipeline_build_timing(pipeline, job, duration) if duration
         pipeline.hdel(key_queue_running, @worker_id)
         pipeline.sadd(key_queue_processed, job)
         pipeline.rpush(key("queue", "jobs_per_worker", @worker_id), job)
@@ -257,10 +292,7 @@ module RSpecQ
     end
 
     def record_build_timing(job, duration)
-      @redis.pipelined do |pipeline|
-        pipeline.zadd(key_build_timings, duration, job)
-        pipeline.incrby(key_build_execution_time_ms, (duration * 1000).to_i)
-      end
+      @redis.pipelined { |pipeline| pipeline_build_timing(pipeline, job, duration) }
     end
 
     def total_execution_time_ms
@@ -285,11 +317,7 @@ module RSpecQ
     end
 
     def record_worker_heartbeat
-      @redis.zadd(key_worker_heartbeats, current_time, @worker_id)
-    end
-
-    def increment_example_count(n)
-      @redis.incrby(key_example_count, n)
+      eval_script(RECORD_WORKER_HEARTBEAT, keys: [key_worker_heartbeats], argv: [@worker_id])
     end
 
     def example_count
@@ -660,6 +688,11 @@ module RSpecQ
 
     def key(*keys)
       [@build_id, keys].join(":")
+    end
+
+    def pipeline_build_timing(pipeline, job, duration)
+      pipeline.zadd(key_build_timings, duration, job)
+      pipeline.incrby(key_build_execution_time_ms, (duration * 1000).to_i)
     end
 
     # We don't use any Ruby `Time` methods because specs that use timecop in

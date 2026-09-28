@@ -8,9 +8,8 @@ module RSpecQ
   WORKER_LIVENESS_SEC = 60.0
 end
 
-require_relative "rspecq/formatters/example_count_recorder"
 require_relative "rspecq/formatters/failure_recorder"
-require_relative "rspecq/formatters/job_timing_recorder"
+require_relative "rspecq/formatters/summary_recorder"
 require_relative "rspecq/formatters/worker_heartbeat_recorder"
 
 require_relative "rspecq/queue"

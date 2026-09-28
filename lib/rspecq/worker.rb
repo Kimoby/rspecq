@@ -81,8 +81,7 @@ module RSpecQ
       @reproduction = false
       @shutdown_pipe = shutdown_pipe
 
-      RSpec::Core::Formatters.register(Formatters::JobTimingRecorder, :dump_summary)
-      RSpec::Core::Formatters.register(Formatters::ExampleCountRecorder, :dump_summary)
+      RSpec::Core::Formatters.register(Formatters::SummaryRecorder, :dump_summary)
       RSpec::Core::Formatters.register(Formatters::FailureRecorder, :example_failed, :message)
       RSpec::Core::Formatters.register(Formatters::WorkerHeartbeatRecorder, :example_finished)
     end
@@ -110,31 +109,19 @@ module RSpecQ
       Kernel.srand(seed)
 
       loop do
-        # we have to bootstrap this so that it can be used in the first call
-        # to `requeue_lost_job` inside the work loop
-        update_heartbeat
-
         return if shutdown?
 
-        if queue.build_failed_fast?
-          queue.try_mark_finished # build is finished
-          return
-        end
+        status, job, lost, lost_worker = queue.reserve_next_job
+        # reserve_next_job also refreshed our heartbeat
+        @heartbeat_updated_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
 
-        lost, lost_worker = queue.requeue_lost_job
         puts "Requeued lost job: #{lost} from #{lost_worker}" if lost
 
-        # TODO: can we make `reserve_job` also act like exhausted? and get
-        # rid of `exhausted?` (i.e. return false if no jobs remain)
-        job = queue.reserve_job
-
-        # build is finished
-        if job.nil? && queue.exhausted?
-          queue.try_mark_finished
+        case status
+        when "failed_fast", "exhausted"
+          queue.try_mark_finished # build is finished
           return
-        end
-
-        if job.nil?
+        when "empty"
           # backoff if no job is available
           sleep 1
           next
@@ -150,10 +137,9 @@ module RSpecQ
         RSpec.configuration.seed = seed
         RSpec.configuration.backtrace_formatter.filter_gem("rspecq")
         RSpec.configuration.add_formatter(Formatters::FailureRecorder.new(queue, job, max_requeues, @worker_id))
-        RSpec.configuration.add_formatter(Formatters::ExampleCountRecorder.new(queue))
         RSpec.configuration.add_formatter(Formatters::WorkerHeartbeatRecorder.new(self))
-        jt = Formatters::JobTimingRecorder.new(queue, job)
-        RSpec.configuration.add_formatter(jt)
+        sr = Formatters::SummaryRecorder.new
+        RSpec.configuration.add_formatter(sr)
 
         options = ["--format", "progress", job]
         tags.each { |tag| options.push("--tag", tag) }
@@ -163,14 +149,18 @@ module RSpecQ
 
         took = "---"
         load_time = "---"
-        if jt.summary
-          took = jt.summary.duration.round(2)
-          load_time = jt.summary.load_time.round(2)
+        if sr.summary
+          took = sr.summary.duration.round(2)
+          load_time = sr.summary.load_time.round(2)
         end
 
         puts "Executed #{job} took=#{took} load-time=#{load_time}"
 
-        queue.acknowledge_job(job)
+        queue.complete_job(
+          job,
+          example_count: sr.summary&.examples&.count,
+          duration: sr.summary && Float(sr.summary.duration)
+        )
       end
     end
 
